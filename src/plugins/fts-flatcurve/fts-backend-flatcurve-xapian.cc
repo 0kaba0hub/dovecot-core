@@ -99,9 +99,19 @@ extern "C" {
 		FLATCURVE_XAPIAN_DB_KEY_PREFIX FTS_FLATCURVE_LABEL
 #define FLATCURVE_XAPIAN_DB_VERSION 1
 
+/* A glass database announces itself with iamglass. flintlock is Xapian's lock
+   file and is present in every shard, so a directory holding nothing but it is
+   as empty as one holding nothing at all. */
+#define FLATCURVE_XAPIAN_GLASS_FILE "iamglass"
+#define FLATCURVE_XAPIAN_LOCK_FILE "flintlock"
+/* What an NFS client renames a deleted-but-open file to. */
+#define FLATCURVE_NFS_SILLY_PREFIX ".nfs"
+
 #define FLATCURVE_DBW_LOCK_RETRY_SECS 1
 #define FLATCURVE_DBW_LOCK_RETRY_MAX 60
 #define FLATCURVE_MANUAL_OPTIMIZE_COMMIT_LIMIT 500
+/* Per-document skip warnings are capped; the total is always logged. */
+#define FLATCURVE_OPTIMIZE_SKIP_LOG_LIMIT 10
 
 /* Lock: needed to ensure we don't run into race conditions when
  * manipulating current directory. */
@@ -130,6 +140,10 @@ struct flatcurve_xapian_db {
 	struct flatcurve_xapian_db_path *dbpath;
 	unsigned int changes;
 	enum flatcurve_xapian_db_type type;
+	/* Shard is part of db_read. Not the same as db being non-NULL: db is
+	   opened before the version check, so a shard that fails that check
+	   has a db but was never added. */
+	bool in_read:1;
 };
 HASH_TABLE_DEFINE_TYPE(xapian_db, char *, struct flatcurve_xapian_db *);
 
@@ -215,6 +229,10 @@ struct fts_flatcurve_xapian_query_iter {
 	Xapian::Enquire *enquire;
 	Xapian::MSetIterator mset_iter;
 	Xapian::MSet m;
+	/* Shards are searched one at a time; see query_iter_next(). */
+	ARRAY(struct flatcurve_xapian_db *) shards;
+	unsigned int shard_idx;
+	Xapian::Query cur_query;
 	bool init:1;
 	bool main_query:1;
 };
@@ -667,6 +685,7 @@ fts_flatcurve_xapian_db_read_add(struct flatcurve_fts_backend *backend,
 
 	++x->shards;
 	x->db_read->add_database(*(xdb->db));
+	xdb->in_read = TRUE;
 
 	if (!x->deinit && fts_flatcurve_xapian_need_optimize(backend))
 		fts_flatcurve_xapian_optimize_mailbox(backend);
@@ -711,6 +730,74 @@ fts_flatcurve_xapian_create_current(struct flatcurve_fts_backend *backend,
 		return 0;
 
 	return fts_flatcurve_xapian_close_db(backend, xdb, copts, error_r);
+}
+
+enum flatcurve_xapian_db_dir {
+	/* Holds a database: iamglass is there. */
+	FLATCURVE_XAPIAN_DB_DIR_DB,
+	/* Holds nothing but, at most, flintlock. */
+	FLATCURVE_XAPIAN_DB_DIR_EMPTY,
+	/* Holds nothing but .nfsXXXX: a shard being removed right now, whose
+	   files another process still has open. */
+	FLATCURVE_XAPIAN_DB_DIR_BUSY,
+	/* Holds real files but no iamglass: a damaged shard, not a leftover. */
+	FLATCURVE_XAPIAN_DB_DIR_NO_DB,
+	/* The directory could not be read; errno says why. */
+	FLATCURVE_XAPIAN_DB_DIR_ERROR
+};
+
+/* What is in this shard directory? Over NFS a merge cannot remove a shard whose
+   files another process still has open: the client renames them to .nfsXXXX,
+   rmdir() fails with ENOTEMPTY, and unlink_directory() reports success anyway,
+   so the directory survives. Once the handles are released the .nfsXXXX entries
+   are reaped and an empty directory is left behind. Opening it yields
+   DatabaseNotFoundError, which is what breaks later optimize runs. Emptiness is
+   the only safe evidence of that: a directory with files but no iamglass is a
+   shard whose data is still there, and deleting it would lose mail from the
+   index for good, since last_uid only tracks the highest UID. While the handles
+   are still held the directory holds .nfsXXXX and nothing else -- iamglass has
+   been renamed too -- which is the ordinary transient state on a busy folder,
+   not damage. Nothing that is not a database goes into db_read: opening one
+   throws DatabaseNotFoundError, which is then followed by a hash_table_clear()
+   panic. */
+static enum flatcurve_xapian_db_dir
+fts_flatcurve_xapian_db_dir_state(struct flatcurve_xapian_db_path *path)
+{
+	DIR *dirp = opendir(path->path);
+	if (dirp == NULL)
+		return FLATCURVE_XAPIAN_DB_DIR_ERROR;
+
+	bool has_db = FALSE, has_nfs = FALSE, has_other = FALSE;
+	const struct dirent *d;
+	errno = 0;
+	while ((d = readdir(dirp)) != NULL) {
+		if (strcmp(d->d_name, ".") == 0 ||
+		    strcmp(d->d_name, "..") == 0 ||
+		    strcmp(d->d_name, FLATCURVE_XAPIAN_LOCK_FILE) == 0)
+			continue;
+		if (strcmp(d->d_name, FLATCURVE_XAPIAN_GLASS_FILE) == 0) {
+			has_db = TRUE;
+			break;
+		}
+		if (str_begins_with(d->d_name, FLATCURVE_NFS_SILLY_PREFIX))
+			has_nfs = TRUE;
+		else
+			has_other = TRUE;
+		/* Keep looking: iamglass may come later in the stream. */
+	}
+	int err = errno;
+	(void)closedir(dirp);
+	if (d == NULL && err != 0) {
+		errno = err;
+		return FLATCURVE_XAPIAN_DB_DIR_ERROR;
+	}
+	if (has_db)
+		return FLATCURVE_XAPIAN_DB_DIR_DB;
+	if (has_other)
+		return FLATCURVE_XAPIAN_DB_DIR_NO_DB;
+	if (has_nfs)
+		return FLATCURVE_XAPIAN_DB_DIR_BUSY;
+	return FLATCURVE_XAPIAN_DB_DIR_EMPTY;
 }
 
 /* Returns: 0 on success, -1 on error */
@@ -761,6 +848,46 @@ fts_flatcurve_xapian_db_populate(struct flatcurve_fts_backend *backend,
 		const char *error, *last_error = NULL;
 		iter = fts_flatcurve_xapian_db_iter_init(backend, opts);
 		while (fts_flatcurve_xapian_db_iter_next(iter)) {
+			if (iter->type == FLATCURVE_XAPIAN_DB_TYPE_INDEX ||
+			    iter->type == FLATCURVE_XAPIAN_DB_TYPE_CURRENT) {
+				/* An empty leftover is skipped rather than
+				   opened: adding it means every later read
+				   reports DatabaseNotFoundError, followed by a
+				   hash_table_clear() panic. Nothing that is
+				   not a database is opened; removing leftovers
+				   belongs to optimize, which holds the lock. */
+				enum flatcurve_xapian_db_dir state =
+					fts_flatcurve_xapian_db_dir_state(
+						iter->path);
+				if (state == FLATCURVE_XAPIAN_DB_DIR_EMPTY)
+					continue;
+				if (state == FLATCURVE_XAPIAN_DB_DIR_BUSY) {
+					e_debug(backend->event,
+						"Shard is being removed, "
+						"skipping it; %s",
+						iter->path->fname);
+					continue;
+				}
+				/* Kept on disk, but out of the index: its
+				   documents are missing from search until an
+				   operator reindexes the folder. */
+				if (state == FLATCURVE_XAPIAN_DB_DIR_ERROR) {
+					e_warning(backend->event,
+						  "Cannot read shard directory, "
+						  "leaving it out of the index; "
+						  "%s: %m", iter->path->fname);
+					continue;
+				}
+				if (state == FLATCURVE_XAPIAN_DB_DIR_NO_DB) {
+					e_warning(backend->event,
+						  "Shard has files but no "
+						  FLATCURVE_XAPIAN_GLASS_FILE
+						  ", leaving it out of the "
+						  "index; %s",
+						  iter->path->fname);
+					continue;
+				}
+			}
 			if (fts_flatcurve_xapian_db_add(
 				backend, iter->path, iter->type,
 				FALSE, NULL, &last_error) < 0)
@@ -1484,6 +1611,7 @@ fts_flatcurve_xapian_close_db(struct flatcurve_fts_backend *backend,
 			       FLATCURVE_XAPIAN_DB_CLOSE_MBOX)) {
 		delete(xdb->db);
 		xdb->db = NULL;
+		xdb->in_read = FALSE;
 	}
 
 	return 0;
@@ -1550,19 +1678,51 @@ int fts_flatcurve_xapian_close(struct flatcurve_fts_backend *backend,
 	return ret;
 }
 
-static uint32_t
-fts_flatcurve_xapian_get_last_uid_query(struct flatcurve_fts_backend *backend ATTR_UNUSED,
-					Xapian::Database *db)
+/* Highest UID in one shard. Read on its own the docid is the UID as stored: a
+   combined database would renumber it to (docid-1)*shards + offset, which
+   overflows 32-bit Xapian::docid once the UIDs are large.
+
+   Returns: 0 on success, -1 on error. An error is reported rather than answered
+   with 0, because a 0 from the shard holding the highest UID would lower the
+   caller's maximum and quietly send the indexer over that range again -- the
+   very symptom this is fixing, only without a trace. */
+static int
+fts_flatcurve_xapian_get_last_uid_shard(struct flatcurve_xapian_db *xdb,
+					uint32_t *last_uid_r,
+					const char **error_r)
 {
-	Xapian::Enquire enquire(*db);
-	Xapian::MSet m;
+	try {
+		Xapian::docid did = xdb->db->get_lastdocid();
+		if (did == 0) {
+			*last_uid_r = 0;
+			return 0;
+		}
+		/* Cheap path: the highest ID is still present. */
+		(void)xdb->db->get_document(did);
+		*last_uid_r = (uint32_t)did;
+		return 0;
+	} catch (Xapian::DocNotFoundError &e) {
+		/* It was expunged; find the highest one still there. */
+	} catch (Xapian::InvalidArgumentError &e) {
+		/* Empty shard. */
+		*last_uid_r = 0;
+		return 0;
+	} catch (Xapian::Error &e) {
+		*error_r = t_strdup(e.get_description().c_str());
+		return -1;
+	}
 
-	enquire.set_docid_order(Xapian::Enquire::DESCENDING);
-	enquire.set_query(Xapian::Query::MatchAll);
-
-	m = enquire.get_mset(0, 1);
-	return (m.empty())
-		? 0 : m.begin().get_document().get_docid();
+	try {
+		Xapian::Enquire enquire(*xdb->db);
+		enquire.set_docid_order(Xapian::Enquire::DESCENDING);
+		enquire.set_query(Xapian::Query::MatchAll);
+		Xapian::MSet m = enquire.get_mset(0, 1);
+		*last_uid_r = m.empty() ? 0 : (uint32_t)*m.begin();
+		return 0;
+	} catch (Xapian::Error &e) {
+		*error_r = t_strdup(e.get_description().c_str());
+		return -1;
+	}
 }
 
 /* Returns: 0 on success, -1 on error */
@@ -1584,20 +1744,37 @@ int fts_flatcurve_xapian_get_last_uid(struct flatcurve_fts_backend *backend,
 		return 0;
 	}
 
-	try {
-		/* Optimization: if last used ID still exists in  mailbox,
-		 * this is a cheap call. */
-		*last_uid_r = db->get_document(db->get_lastdocid()).get_docid();
-		return 0;
-	} catch (Xapian::DocNotFoundError &e) {
-		/* Last used Xapian ID is no longer in the DB. Need
-			* to do a manual search for the last existing ID. */
-		*last_uid_r = fts_flatcurve_xapian_get_last_uid_query(backend, db);
-		return 0;
-	} catch (Xapian::InvalidArgumentError &e) {
-		*last_uid_r = 0;
-		return 0;
+	/* Ask each shard separately and keep the highest answer. Asking the
+	   combined database returns a renumbered docid, which wraps once
+	   uid * databases passes 2^32 and lands below the mailbox's real range
+	   -- the indexer then treats indexed mail as new and reindexes the
+	   whole folder on every run. */
+	struct flatcurve_xapian *x = backend->xapian;
+	uint32_t last_uid = 0;
+	void *key, *val;
+	struct hash_iterate_context *hiter = hash_table_iterate_init(x->dbs);
+
+	while (hash_table_iterate(hiter, x->dbs, &key, &val)) {
+		struct flatcurve_xapian_db *xdb =
+			(struct flatcurve_xapian_db *)val;
+		if ((xdb->type != FLATCURVE_XAPIAN_DB_TYPE_INDEX &&
+		     xdb->type != FLATCURVE_XAPIAN_DB_TYPE_CURRENT) ||
+		    !xdb->in_read)
+			continue;
+
+		uint32_t uid;
+		if (fts_flatcurve_xapian_get_last_uid_shard(
+			xdb, &uid, error_r) < 0) {
+			hash_table_iterate_deinit(&hiter);
+			return -1;
+		}
+		if (uid > last_uid)
+			last_uid = uid;
 	}
+	hash_table_iterate_deinit(&hiter);
+
+	*last_uid_r = last_uid;
+	return 0;
 }
 
 /* Returns: 0 not found, 1 if found, -1 on error */
@@ -1810,6 +1987,21 @@ int fts_flatcurve_xapian_delete_index(struct flatcurve_fts_backend *backend,
 	return ret;
 }
 
+/* Current shard last: replace_document() lets the last write win, so the newest
+   copy must be written last. Index shard names carry no creation order (the
+   suffix is i_rand_limit), so sorting them is only for a stable pass order. */
+static int
+fts_flatcurve_xapian_shard_cmp(struct flatcurve_xapian_db *const *a,
+			       struct flatcurve_xapian_db *const *b)
+{
+	bool a_cur = (*a)->type == FLATCURVE_XAPIAN_DB_TYPE_CURRENT;
+	bool b_cur = (*b)->type == FLATCURVE_XAPIAN_DB_TYPE_CURRENT;
+
+	if (a_cur != b_cur)
+		return a_cur ? 1 : -1;
+	return strcmp((*a)->dbpath->fname, (*b)->dbpath->fname);
+}
+
 /* Returns: 0 on success, -1 on error */
 static int
 fts_flatcurve_xapian_optimize_rebuild(struct flatcurve_fts_backend *backend,
@@ -1829,33 +2021,103 @@ fts_flatcurve_xapian_optimize_rebuild(struct flatcurve_fts_backend *backend,
 		backend, xdb, FLATCURVE_XAPIAN_WDB_CREATE, error_r) < 0)
 		return -1;
 
-	Xapian::Enquire enquire(*db);
-	enquire.set_docid_order(Xapian::Enquire::ASCENDING);
-	enquire.set_query(Xapian::Query::MatchAll);
-
-	Xapian::MSet mset = enquire.get_mset(0, db->get_doccount());
-	Xapian::MSetIterator iter = mset.begin();
-
+	/* Copy shard by shard, not through the combined database: opening several
+	   databases at once renumbers docids to (docid-1)*shards + offset, which
+	   overflows 32-bit Xapian::docid when the docids are large IMAP UIDs. */
 	unsigned int updates = 0;
-	for (iter = mset.begin(); iter != mset.end(); ++iter) {
-		Xapian::Document doc = iter.get_document();
+	unsigned int skipped = 0;
+
+	ARRAY(struct flatcurve_xapian_db *) shards;
+	t_array_init(&shards, x->shards + 1);
+
+	void *key, *val;
+	/* xdb, the destination, is never in x->dbs: it is allocated here and only
+	   open_db() inserts, which takes INDEX/CURRENT alone. Nothing reads what
+	   this loop writes. */
+	struct hash_iterate_context *hiter = hash_table_iterate_init(x->dbs);
+	while (hash_table_iterate(hiter, x->dbs, &key, &val)) {
+		struct flatcurve_xapian_db *sdb =
+			(struct flatcurve_xapian_db *)val;
+		if ((sdb->type == FLATCURVE_XAPIAN_DB_TYPE_INDEX ||
+		     sdb->type == FLATCURVE_XAPIAN_DB_TYPE_CURRENT) &&
+		    sdb->in_read)
+			array_push_back(&shards, &sdb);
+	}
+	hash_table_iterate_deinit(&hiter);
+
+	array_sort(&shards, fts_flatcurve_xapian_shard_cmp);
+
+	struct flatcurve_xapian_db *const *sdbp;
+	array_foreach(&shards, sdbp) {
+		struct flatcurve_xapian_db *sdb = *sdbp;
+		Xapian::PostingIterator p, pend;
+
 		try {
-	                xdb->dbw->replace_document(doc.get_docid(), doc);
-			if (++updates > FLATCURVE_MANUAL_OPTIMIZE_COMMIT_LIMIT) {
-				xdb->dbw->commit();
-				updates = 0;
-			}
-	        } catch (Xapian::Error &e) {
+			p = sdb->db->postlist_begin(std::string());
+			pend = sdb->db->postlist_end(std::string());
+		} catch (Xapian::Error &e) {
 			*error_r = t_strdup(e.get_description().c_str());
 			return -1;
 		}
+
+		while (p != pend) {
+			try {
+				Xapian::Document doc =
+					sdb->db->get_document(*p);
+				xdb->dbw->replace_document(doc.get_docid(),
+							   doc);
+				if (++updates >
+				    FLATCURVE_MANUAL_OPTIMIZE_COMMIT_LIMIT) {
+					xdb->dbw->commit();
+					updates = 0;
+				}
+			} catch (Xapian::DocNotFoundError &e) {
+				/* Renumbering aside, this means the shard itself is
+				   damaged. Skipping keeps the rebuild going, but the
+				   document is lost to the index -- so say so. */
+				if (skipped < FLATCURVE_OPTIMIZE_SKIP_LOG_LIMIT)
+					e_warning(backend->event,
+						  "Optimize: skipping "
+						  "unreadable document; %s",
+						  e.get_description().c_str());
+				++skipped;
+			} catch (Xapian::Error &e) {
+				*error_r = t_strdup(e.get_description().c_str());
+				return -1;
+			}
+			++p;
+		}
 	}
+
+	if (skipped > 0)
+		e_warning(backend->event, "Optimize: skipped %u unreadable "
+			  "document(s); the index is damaged and a full "
+			  "reindex is needed for those messages", skipped);
 
 	return fts_flatcurve_xapian_close_db(
 			backend, xdb, FLATCURVE_XAPIAN_DB_CLOSE_WDB, error_r);
 }
 
-/* Returns: 0 on success, -1 on error */
+static void fts_flatcurve_xapian_strings_free(ARRAY_TYPE(const_string) *a)
+{
+	const char *const *namep;
+	array_foreach(a, namep)
+		i_free(*(char **)namep);
+	array_free(a);
+}
+
+static bool
+fts_flatcurve_xapian_strings_have(const ARRAY_TYPE(const_string) *a,
+				  const char *name)
+{
+	const char *const *namep;
+	array_foreach(a, namep) {
+		if (strcmp(*namep, name) == 0)
+			return TRUE;
+	}
+	return FALSE;
+}
+
 static int
 fts_flatcurve_xapian_optimize_box_do(struct flatcurve_fts_backend *backend,
 				     Xapian::Database *db, const char **error_r)
@@ -1871,12 +2133,42 @@ fts_flatcurve_xapian_optimize_box_do(struct flatcurve_fts_backend *backend,
 	 * are optimizing. */
 
 	void *key, *val;
+	/* Which shards the merge is about to read. Only these may be deleted
+	   later: a shard db_populate() skipped -- unreadable at that moment,
+	   then readable again by the time the old ones go -- was never merged,
+	   and deleting it would take its mail out of the index for good. Taken
+	   here, before anything can add to db_read, and i_strdup'd because
+	   closing the databases p_clear()s the pool the names live in. */
+	ARRAY_TYPE(const_string) merged;
+	i_array_init(&merged, hash_table_count(x->dbs) + 1);
+	struct hash_iterate_context *miter = hash_table_iterate_init(x->dbs);
+	while (hash_table_iterate(miter, x->dbs, &key, &val)) {
+		struct flatcurve_xapian_db *xdb =
+			(struct flatcurve_xapian_db *)val;
+		if (xdb->in_read) {
+			const char *name = i_strdup((const char *)key);
+			array_push_back(&merged, &name);
+		}
+	}
+	hash_table_iterate_deinit(&miter);
+
+	/* xdb, the destination, is never in x->dbs: it is allocated here and only
+	   open_db() inserts, which takes INDEX/CURRENT alone. Nothing reads what
+	   this loop writes. */
 	struct hash_iterate_context *hiter = hash_table_iterate_init(x->dbs);
 	while (hash_table_iterate(hiter, x->dbs, &key, &val)) {
 		struct flatcurve_xapian_db *db = (struct flatcurve_xapian_db *)val;
 		if (fts_flatcurve_xapian_write_db_get(
-			backend, db, wopts, error_r) < 0)
+			backend, db, wopts, error_r) < 0) {
+			/* Upstream returns here without deinit, leaving the
+			   table frozen; the hash_table_clear() in close() then
+			   panics and the process dies in the unwinder. Any
+			   write_db_get error does it: a damaged shard, ESTALE,
+			   or the 60-second write lock timeout. */
+			hash_table_iterate_deinit(&hiter);
+			fts_flatcurve_xapian_strings_free(&merged);
 			return -1;
+		}
 	}
 	hash_table_iterate_deinit(&hiter);
 
@@ -1884,8 +2176,10 @@ fts_flatcurve_xapian_optimize_box_do(struct flatcurve_fts_backend *backend,
 	struct flatcurve_xapian_db_path *dbpath =
 		fts_flatcurve_xapian_create_db_path(
 			backend, FLATCURVE_XAPIAN_DB_OPTIMIZE);
-	if (fts_flatcurve_xapian_delete(backend, dbpath, error_r) < 0)
+	if (fts_flatcurve_xapian_delete(backend, dbpath, error_r) < 0) {
+		fts_flatcurve_xapian_strings_free(&merged);
 		return -1;
+	}
 
 	struct timeval start;
 	i_gettimeofday(&start);
@@ -1922,28 +2216,89 @@ fts_flatcurve_xapian_optimize_box_do(struct flatcurve_fts_backend *backend,
 	}
 	if (failed) {
 		e_error(backend->event, "Optimize failed: %s", *error_r);
+		fts_flatcurve_xapian_strings_free(&merged);
 		return 0;
 	}
 
 	/* Close all write handles before deleting directories. */
-	if (fts_flatcurve_xapian_refresh(backend, error_r) < 0)
+	if (fts_flatcurve_xapian_refresh(backend, error_r) < 0) {
+		fts_flatcurve_xapian_strings_free(&merged);
 		return -1;
+	}
 
-	/* Delete old indexes. */
+	/* Delete old indexes, and any empty directory left behind by a merge that
+	   could not remove one earlier (see db_dir_state). Nothing can be
+	   creating a shard meanwhile: creation and optimize both hold the
+	   flatcurve lock. */
 	struct flatcurve_xapian_db_iter *iter =
 		fts_flatcurve_xapian_db_iter_init(backend, opts);
 
 	int ret = 0;
+	unsigned int stale = 0;
 	while (fts_flatcurve_xapian_db_iter_next(iter)) {
 		if (iter->type == FLATCURVE_XAPIAN_DB_TYPE_INDEX ||
 		    iter->type == FLATCURVE_XAPIAN_DB_TYPE_CURRENT) {
+			enum flatcurve_xapian_db_dir state =
+				fts_flatcurve_xapian_db_dir_state(iter->path);
+			if (state == FLATCURVE_XAPIAN_DB_DIR_DB &&
+			    !fts_flatcurve_xapian_strings_have(
+					&merged, iter->path->fname)) {
+				/* On disk, holds a database, but was not part
+				   of the merge -- see the comment above. */
+				e_warning(backend->event,
+					  "Shard was not merged, keeping it; "
+					  "%s", iter->path->fname);
+				continue;
+			}
+			/* Only an empty directory is known to be a leftover.
+			   A shard we could not read, or one whose iamglass is
+			   gone while its data is not, is kept: it needs
+			   reindexing, not deleting. */
+			if (state == FLATCURVE_XAPIAN_DB_DIR_ERROR) {
+				e_warning(backend->event,
+					  "Cannot read shard directory, "
+					  "keeping it; %s: %m",
+					  iter->path->fname);
+				continue;
+			}
+			if (state == FLATCURVE_XAPIAN_DB_DIR_NO_DB) {
+				e_warning(backend->event,
+					  "Shard has files but no "
+					  FLATCURVE_XAPIAN_GLASS_FILE
+					  ", keeping it; %s",
+					  iter->path->fname);
+				continue;
+			}
+			if (state == FLATCURVE_XAPIAN_DB_DIR_BUSY) {
+				/* Normal while a client has the folder open;
+				   the next optimize gets it. */
+				e_debug(backend->event,
+					"Shard is still being removed, "
+					"keeping it; %s", iter->path->fname);
+				continue;
+			}
 			if (fts_flatcurve_xapian_delete(
 				backend, iter->path, error_r) < 0) {
 				ret = -1;
 				break;
 			}
+			if (state == FLATCURVE_XAPIAN_DB_DIR_EMPTY) {
+				/* Capped like the skip warnings in
+				   optimize_rebuild(): a single folder can
+				   accumulate dozens of these. */
+				if (stale < FLATCURVE_OPTIMIZE_SKIP_LOG_LIMIT)
+					e_warning(backend->event,
+						  "Removed leftover shard "
+						  "directory with no database "
+						  "in it; %s",
+						  iter->path->fname);
+				++stale;
+			}
 		}
 	}
+	if (stale > 0)
+		e_warning(backend->event, "Removed %u leftover shard "
+			  "directory/directories", stale);
 	const char *error;
 	if (fts_flatcurve_xapian_db_iter_deinit(&iter, &error) < 0) {
 		if (ret < 0)
@@ -1952,6 +2307,7 @@ fts_flatcurve_xapian_optimize_box_do(struct flatcurve_fts_backend *backend,
 			*error_r = error;
 		ret = -1;
 	}
+	fts_flatcurve_xapian_strings_free(&merged);
 	if (ret < 0)
 		return -1;
 
@@ -2206,6 +2562,76 @@ void fts_flatcurve_xapian_build_query(struct flatcurve_fts_query *query)
 		fts_flatcurve_build_query_arg(query, args);
 }
 
+/* Collect the shards to search. Each is searched on its own, because a combined
+   database renumbers docids to (docid-1)*shards + offset and that wraps 32-bit
+   Xapian::docid when the docids are large IMAP UIDs -- the hits would then
+   carry UIDs the mailbox does not have. */
+static void
+fts_flatcurve_xapian_query_iter_shards(struct fts_flatcurve_xapian_query_iter *iter)
+{
+	struct flatcurve_xapian *x = iter->query->backend->xapian;
+	void *key, *val;
+
+	/* Called twice per query -- once for the main pass, once for the maybe
+	   queries. p_array_init would allocate a second buffer from the query
+	   pool and strand the first one there until the query ends. */
+	if (array_is_created(&iter->shards))
+		array_clear(&iter->shards);
+	else
+		p_array_init(&iter->shards, iter->query->pool, x->shards + 1);
+
+	struct hash_iterate_context *hiter = hash_table_iterate_init(x->dbs);
+	while (hash_table_iterate(hiter, x->dbs, &key, &val)) {
+		struct flatcurve_xapian_db *xdb =
+			(struct flatcurve_xapian_db *)val;
+		/* in_read, not db != NULL: a shard that failed its version
+		   check has an open db but is not in db_read, and searching it
+		   here would diverge from what the rest of the code sees. */
+		if ((xdb->type == FLATCURVE_XAPIAN_DB_TYPE_INDEX ||
+		     xdb->type == FLATCURVE_XAPIAN_DB_TYPE_CURRENT) &&
+		    xdb->in_read)
+			array_push_back(&iter->shards, &xdb);
+	}
+	hash_table_iterate_deinit(&hiter);
+
+	iter->shard_idx = 0;
+}
+
+/* Move to the next shard that has hits. Returns FALSE when none are left. */
+static bool
+fts_flatcurve_xapian_query_iter_mset(struct fts_flatcurve_xapian_query_iter *iter)
+{
+	while (iter->shard_idx < array_count(&iter->shards)) {
+		struct flatcurve_xapian_db *const *xdbp =
+			array_idx(&iter->shards, iter->shard_idx);
+		++iter->shard_idx;
+
+		if (iter->enquire != NULL) {
+			delete(iter->enquire);
+			iter->enquire = NULL;
+		}
+
+		try {
+			iter->enquire = new Xapian::Enquire(*(*xdbp)->db);
+			iter->enquire->set_docid_order(Xapian::Enquire::DONT_CARE);
+			iter->enquire->set_query(iter->cur_query);
+			iter->m = iter->enquire->get_mset(
+				0, (*xdbp)->db->get_doccount());
+		} catch (Xapian::DatabaseModifiedError &e) {
+			/* reopen() has already been called; see below. */
+			i_unreached();
+		} catch (Xapian::Error &e) {
+			iter->error = i_strdup(e.get_description().c_str());
+			return FALSE;
+		}
+
+		iter->mset_iter = iter->m.begin();
+		if (iter->mset_iter != iter->m.end())
+			return TRUE;
+	}
+	return FALSE;
+}
+
 struct fts_flatcurve_xapian_query_iter *
 fts_flatcurve_xapian_query_iter_init(struct flatcurve_fts_query *query)
 {
@@ -2258,6 +2684,8 @@ fts_flatcurve_xapian_query_iter_next(struct fts_flatcurve_xapian_query_iter *ite
 		if (q == NULL)
 			return FALSE;
 
+		/* Still opens and refreshes the shards; the combined database
+		 * it returns is no longer what the search runs against. */
 		if (iter->db == NULL) {
 			const char *error;
 			int ret = fts_flatcurve_xapian_read_db(
@@ -2268,44 +2696,35 @@ fts_flatcurve_xapian_query_iter_next(struct fts_flatcurve_xapian_query_iter *ite
 				return FALSE;
 		}
 
-		if (iter->enquire == NULL) {
-			iter->enquire = new Xapian::Enquire(*iter->db);
-			iter->enquire->set_docid_order(Xapian::Enquire::DONT_CARE);
-		}
-		iter->enquire->set_query(*q);
+		iter->cur_query = *q;
+		fts_flatcurve_xapian_query_iter_shards(iter);
 
-		try {
-			iter->m = iter->enquire->get_mset(0, iter->db->get_doccount());
-		} catch (Xapian::DatabaseModifiedError &e) {
-			/* Per documentation, this is only thrown if more than
-			 * one change has been made to the database. To
-			 * resolve you need to reopen the DB (Xapian can
-			 * handle a single snapshot of a modified DB natively,
-			 * so this only occurs if there have been multiple
-			 * writes). However, we ALWAYS want to use the
-			 * most up-to-date version, so we have already
-			 * explicitly called reopen() above. Thus, we should
-			 * never see this exception. */
-			i_unreached();
+		if (!fts_flatcurve_xapian_query_iter_mset(iter)) {
+			if (iter->error != NULL || !iter->main_query)
+				return FALSE;
+			iter->init = iter->main_query = FALSE;
+			return fts_flatcurve_xapian_query_iter_next(iter,
+								   result_r);
 		}
-
-		iter->mset_iter = iter->m.begin();
 	}
 
 	if (iter->mset_iter == iter->m.end()) {
-		if (!iter->main_query)
-			return FALSE;
-		iter->init = iter->main_query = FALSE;
-		return fts_flatcurve_xapian_query_iter_next(iter, result_r);
+		/* Current shard is exhausted; take the rest before moving on
+		 * to the maybe queries. */
+		if (!fts_flatcurve_xapian_query_iter_mset(iter)) {
+			if (iter->error != NULL || !iter->main_query)
+				return FALSE;
+			iter->init = iter->main_query = FALSE;
+			return fts_flatcurve_xapian_query_iter_next(iter,
+								   result_r);
+		}
 	}
 
 	iter->result->maybe = !iter->main_query;
 	iter->result->score = iter->mset_iter.get_weight();
-	/* MSet docid can be an "interleaved" docid generated by
-	 * Xapian::Database when handling multiple DBs at once. Instead, we
-	 * want the "unique docid", which is obtained by looking at the
-	 * doc id from the Document object itself. */
-	iter->result->uid = iter->mset_iter.get_document().get_docid();
+	/* One shard at a time, so nothing is renumbered and the docid is the
+	 * UID exactly as it was stored. */
+	iter->result->uid = (uint32_t)*iter->mset_iter;
 	++iter->mset_iter;
 
 	*result_r = iter->result;

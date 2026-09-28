@@ -166,6 +166,16 @@ dir_entry_get(struct fs_list_iterate_context *ctx, const char *dir_path,
 		dir->info_flags |= MAILBOX_SELECT;
 		return 0;
 	}
+	if (ctx->ctx.iter_from_index_dir &&
+	    strcmp(fname, "fts-flatcurve") == 0) {
+		/* Skip the fts-flatcurve search index.
+
+		   With mailbox_directory_name_legacy=yes its data ends up in
+		   <index root>/mailboxes/<mailbox>/fts-flatcurve/, which makes
+		   MAILBOX_LIST_ITER_FORCE_RESYNC callers create literal
+		   <mailbox>/fts-flatcurve/ mailboxes. */
+		return 0;
+	}
 	if (ctx->ctx.list->mail_set->mailbox_subscriptions_filename[0] != '\0' &&
 	    strcmp(fname, ctx->ctx.list->mail_set->mailbox_subscriptions_filename) == 0) {
 		/* if this is the subscriptions file, skip it */
